@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from fastapi import APIRouter
 from app.services.chatbot.bot import chatbot_ask
@@ -17,7 +17,7 @@ class Message(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    query: str
+    query: str = Field(min_length=1, max_length=500)
     chat_history: Optional[List[Message]] = None
 
 
@@ -40,5 +40,5 @@ def ask_chatbot(req: ChatRequest) -> ChatResponse:
         answer = chatbot_ask(query=req.query, chat_history=history_dicts)
         return ChatResponse(answer=answer)
     except Exception as e:
-        logger.error(f"Chatbot query failed: {e}")
-        return ChatResponse(answer=f"Sorry, I encountered an internal error while answering: {e}")
+        logger.exception("Chatbot query failed")
+        return ChatResponse(answer="Sorry, the product intelligence service is temporarily unavailable.")

@@ -110,6 +110,8 @@ def resolve_product(state: EnrichmentState) -> Dict[str, Any]:
 def retrieve_evidence(state: EnrichmentState) -> Dict[str, Any]:
     """2. Retrieve relevant specification document chunks from Qdrant vector store."""
     logger.info("Node: retrieve_evidence")
+    # A corrective pass must be judged from fresh retrieval and extraction results.
+    fields_needing_review: List[str] = []
     mfg_part_num = state["mfg_part_num"]
     client = get_qdrant_service()
     
@@ -132,6 +134,7 @@ def retrieve_evidence(state: EnrichmentState) -> Dict[str, Any]:
     return {
         "retrieval_query": query,
         "evidence_chunks": hits,
+        "fields_needing_review": fields_needing_review,
     }
 
 
@@ -176,6 +179,7 @@ def verify_evidence(state: EnrichmentState) -> Dict[str, Any]:
     chunks_text = " ".join([chunk["text"].lower() for chunk in state["evidence_chunks"]])
     
     fields_needing_review = list(state.get("fields_needing_review", []))
+    allowed_attributes = ref_service.get_allowed_attributes(state["classpath"])
     
     # Verify grounding
     for name, val in extracted_attr.items():
@@ -185,6 +189,10 @@ def verify_evidence(state: EnrichmentState) -> Dict[str, Any]:
             logger.warning(f"Grounding failure for {name}: {evidence[:50]}")
             if name not in fields_needing_review:
                 fields_needing_review.append(name)
+
+    for name in allowed_attributes:
+        if name not in extracted_attr and name not in fields_needing_review:
+            fields_needing_review.append(name)
                 
     return {"fields_needing_review": fields_needing_review}
 
@@ -228,7 +236,7 @@ def lov_validation(state: EnrichmentState) -> Dict[str, Any]:
             validated[name] = val_clean
         else:
             logger.warning(f"LOV compliance failure for {name}: {val}")
-            validated[name] = val
+            validated[name] = None
             if name not in fields_needing_review:
                 fields_needing_review.append(name)
                 
@@ -250,7 +258,7 @@ def uom_normalization(state: EnrichmentState) -> Dict[str, Any]:
             uoms[name] = ""
             continue
             
-        str_val = str(val)
+        str_val = str(val).strip()
         
         # Check if the attribute requires UOM normalization
         # e.g., Voltage Rating (V), Amperage Rating (A), Sound Level (dBA), Depth With Door Open (in)
@@ -268,10 +276,13 @@ def uom_normalization(state: EnrichmentState) -> Dict[str, Any]:
                 uoms[name] = ""
         else:
             uoms[name] = ""
+            if re.search(r"\d\s*(?:v|volt|a|amp|dba|inch|in)\b", str_val, re.IGNORECASE):
+                if name not in fields_needing_review:
+                    fields_needing_review.append(name)
             
         # Convert decimal inches to fraction inches (e.g. 50.25 -> 50-1/4)
         # Check if unit indicates inches (either in UOM column or inside value itself)
-        if uoms.get(name) == "in" or "in" in str_val.lower() or "inch" in str_val.lower():
+        if uoms.get(name) == "in" and re.fullmatch(r"[-+]?\d+(?:\.\d+)?\s*in(?:ch(?:es)?)?", str_val, re.IGNORECASE):
             # Extract numeric value
             num_part = re.findall(r"[-+]?\d+(?:\.\d+)?", str_val)
             if num_part:
@@ -302,17 +313,17 @@ def description_generation(state: EnrichmentState) -> Dict[str, Any]:
     series = validated.get("Series") or ""
     wash_cycles = validated.get("Number of Wash Cycles") or ""
     voltage = validated.get("Voltage Rating") or ""
-    volt_uom = uoms.get("Voltage Rating") or "V"
+    volt_uom = uoms.get("Voltage Rating") or ""
     amperage = validated.get("Amperage Rating") or ""
-    amp_uom = uoms.get("Amperage Rating") or "A"
+    amp_uom = uoms.get("Amperage Rating") or ""
     mounting = validated.get("Mounting Type") or ""
     sound = validated.get("Sound Level") or ""
-    sound_uom = uoms.get("Sound Level") or "dBA"
+    sound_uom = uoms.get("Sound Level") or ""
     material = validated.get("Material") or ""
     color = validated.get("Color") or ""
     size = validated.get("Size") or ""
     door_depth = validated.get("Depth With Door Open") or ""
-    door_uom = uoms.get("Depth With Door Open") or "in"
+    door_uom = uoms.get("Depth With Door Open") or ""
     min_height = validated.get("Minimum Height") or ""
     max_height = validated.get("Maximum Height") or ""
     add_info = validated.get("Additional Information") or ""
@@ -383,8 +394,6 @@ def description_generation(state: EnrichmentState) -> Dict[str, Any]:
     
     # Details
     details = []
-    if "frigidaire" in brand.lower():
-        details.append("With CleanBoost™")
     if mounting:
         details.append(f"{mounting} Mounting")
     if wash_cycles:
@@ -402,8 +411,6 @@ def description_generation(state: EnrichmentState) -> Dict[str, Any]:
     # Detail items
     long_desc_items = []
     long_desc_items.append("Dishwasher")
-    if "frigidaire" in brand.lower():
-        long_desc_items.append("With CleanBoost™")
     if series:
         long_desc_items.append(series)
     if wash_cycles:
@@ -418,13 +425,13 @@ def description_generation(state: EnrichmentState) -> Dict[str, Any]:
         long_desc_items.append(size)
     if door_depth:
         # Keep space before UOM inside long desc
-        long_desc_items.append(f"{door_depth} {door_uom} Depth With Door Open")
+        long_desc_items.append(f"{door_depth}{f' {door_uom}' if door_uom else ''} Depth With Door Open")
     if min_height:
         # Height specs
         if "rack" in min_height.lower():
             long_desc_items.append(f"{min_height} Minimum Height")
         else:
-            long_desc_items.append(f"{min_height} {door_uom} Minimum Height")
+            long_desc_items.append(f"{min_height}{f' {door_uom}' if door_uom else ''} Minimum Height")
     if max_height:
         long_desc_items.append(f"{max_height} Maximum Height")
     if sound:
@@ -523,14 +530,10 @@ def final_output(state: EnrichmentState) -> Dict[str, Any]:
         if src.startswith("http://") or src.startswith("https://"):
             doc_urls.append(src)
             
-    # Add dummy/reference URLs if none found in evidence
-    # Frigidaire and Whirlpool URLs
-    if not doc_urls:
-        if "frigidaire" in (state["brand_name"] or "").lower():
-            doc_urls.append("https://www.frigidaire.com/en/p/owner-center/product-support/PDSH4816AF")
-        elif "whirlpool" in (state["brand_name"] or "").lower():
-            doc_urls.append("https://www.whirlpool.com/content/dam/global/documents/202412/owners-manual-w11323304-revj.pdf")
-            doc_urls.append("https://www.whirlpool.com/content/dam/global/documents/202406/installation-instructions-w11323304-revG.pdf")
+    for key in ("specification_sheet", "ref_url_1", "ref_url_2"):
+        value = state["product_input"].get(key)
+        if value and value not in doc_urls:
+            doc_urls.append(value)
 
     # Fill MFR URL and Ref URLs
     fields_mapped["MFR URL"] = doc_urls[0] if len(doc_urls) > 0 else ""
@@ -546,8 +549,9 @@ def final_output(state: EnrichmentState) -> Dict[str, Any]:
     fields_mapped["MARKETING_DESCRIPTION"] = state["marketing_description"] or ""
 
     # Standards compliance
-    fields_mapped["With"] = "With CleanBoost™" if "cleanboost" in (state["short_desc"] or "").lower() else ""
-    fields_mapped["Standard/Approvals"] = "ASSE 1006|CEE Tier 2 Qualified|cUL Listed|ENERGY STAR Certified|NSF Certified|UL Listed" if "frigidaire" in (state["brand_name"] or "").lower() else ""
+    additional_information = str(validated.get("Additional Information") or "")
+    fields_mapped["With"] = "CleanBoost" if "cleanboost" in additional_information.lower() else ""
+    fields_mapped["Standard/Approvals"] = ""
     fields_mapped["Prop 65"] = ""
     fields_mapped["Application"] = ""
     fields_mapped["Includes"] = ""
@@ -576,13 +580,8 @@ def final_output(state: EnrichmentState) -> Dict[str, Any]:
 
     # Features
     # If Whirlpool, fill item features
-    if "whirlpool" in (state["brand_name"] or "").lower():
-        features = [
-            "3rd rack with extra wash action", "Adjustable 2nd Rack", "41 dBA",
-            "Moisture Repellent Silverware Basket", "Sensor cycle", "Sani Rinse Option",
-            "Leak Detection System", "Folding Tines", "Normal cycle", "Triple Wash Spray",
-            "Quick Wash Cycle"
-        ]
+    if additional_information:
+        features = [item.strip() for item in re.split(r"[,;]", additional_information) if item.strip()]
         for f_idx in range(1, 21):
             if f_idx <= len(features):
                 fields_mapped[f"ITEM_FEATURES_{f_idx}"] = features[f_idx - 1]
@@ -598,10 +597,7 @@ def final_output(state: EnrichmentState) -> Dict[str, Any]:
     fields_mapped["GTIN"] = ""
     fields_mapped["UNSPSC"] = ""
     
-    if "frigidaire" in (state["brand_name"] or "").lower():
-        fields_mapped["Warranty"] = "1 Year Manufacturer, 1 Year Labor and Parts"
-    else:
-        fields_mapped["Warranty"] = ""
+    fields_mapped["Warranty"] = ""
         
     fields_mapped["List Price"] = ""
     fields_mapped["Selling Qty"] = ""
@@ -621,20 +617,12 @@ def final_output(state: EnrichmentState) -> Dict[str, Any]:
     fields_mapped["VOLUME_UOM"] = ""
 
     # Assets
-    if "frigidaire" in (state["brand_name"] or "").lower():
-        fields_mapped["Product Image"] = "FRIGIDAIRE_PDSH4816AF.jpg"
-        fields_mapped["Alternate Image 1"] = "FRIGIDAIRE_PDSH4816AF_1.jpg"
-        fields_mapped["Alternate Image 2"] = "FRIGIDAIRE_PDSH4816AF_2.jpg"
-        fields_mapped["Alternate Image 3"] = "FRIGIDAIRE_PDSH4816AF_3.jpg"
-        fields_mapped["Alternate Image 4"] = "FRIGIDAIRE_PDSH4816AF_4.jpg"
-        fields_mapped["Specification Sheet"] = "FRIGIDAIRE_PDSH4816AF_Specification_Sheet.pdf"
-    else:
-        fields_mapped["Product Image"] = "Whirlpool_WDTS7024RZ.jpg"
-        fields_mapped["Alternate Image 1"] = ""
-        fields_mapped["Alternate Image 2"] = ""
-        fields_mapped["Alternate Image 3"] = ""
-        fields_mapped["Alternate Image 4"] = ""
-        fields_mapped["Specification Sheet"] = "Whirlpool_WDTS7024RZ_Specification_Sheet.pdf"
+    fields_mapped["Product Image"] = ""
+    fields_mapped["Alternate Image 1"] = ""
+    fields_mapped["Alternate Image 2"] = ""
+    fields_mapped["Alternate Image 3"] = ""
+    fields_mapped["Alternate Image 4"] = ""
+    fields_mapped["Specification Sheet"] = doc_urls[0] if doc_urls else ""
 
     for manual_col in ["SDS", "SDS_1", "Warranty Information", "Catalog",
                        "Instruction/Installation Manual", "Service Manual", 
@@ -647,6 +635,23 @@ def final_output(state: EnrichmentState) -> Dict[str, Any]:
     fields_mapped["Country Of Origin"] = ""
     fields_mapped["Discontinued"] = ""
     fields_mapped["Actual Image (Yes/No)"] = "Yes"
+
+    # Keep provenance and validation signals available to the API/UI while
+    # export_job_excel strips these internal fields from delivery files.
+    confidence = state.get("attribute_confidence", {})
+    evidence = state.get("attribute_evidence", {})
+    attribute_validation = {}
+    for attr_name in allowed_attributes:
+        value = validated.get(attr_name)
+        attribute_validation[attr_name] = {
+            "lov": bool(value) and ref_service.validate_lov_value(state["classpath"], attr_name, str(value)),
+            "uom": bool(value) and (bool(uoms.get(attr_name)) or ref_service.normalize_uom(str(value)) is None),
+            "source": bool(evidence.get(attr_name)),
+            "confidence": float(confidence.get(attr_name, 0.0)),
+            "reason": "low confidence" if float(confidence.get(attr_name, 0.0)) < 0.8 else "grounded in indexed evidence",
+            "evidence": evidence.get(attr_name, ""),
+        }
+    fields_mapped["_attribute_validation"] = attribute_validation
 
     return {"final_output": fields_mapped}
 
@@ -722,6 +727,9 @@ def enrich_product(product: ProductInput) -> dict[str, Any]:
             "unilog_brand": product.unilog_brand,
             "dib_brand": product.dib_brand,
             "part_manuf": product.part_manuf,
+            "specification_sheet": product.specification_sheet,
+            "ref_url_1": product.ref_url_1,
+            "ref_url_2": product.ref_url_2,
         },
         "manufacturer_name": None,
         "brand_name": None,

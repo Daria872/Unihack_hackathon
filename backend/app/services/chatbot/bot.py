@@ -27,7 +27,7 @@ def classify_intent(state: ChatbotState) -> Dict[str, Any]:
     
     # Check for references to parts or specific dishwasher models
     # Frigidaire: PDSH4816AF, Whirlpool: WDTS7024RZ
-    product_pattern = r"(pdsh4816af|wdts7024rz|dishwasher|frigidaire|whirlpool)"
+    product_pattern = r"\b(?=[a-z0-9_-]*\d)[a-z0-9][a-z0-9_-]{5,}\b|attribute|specification|evidence|confidence|validation|lov|uom|human review"
     if re.search(product_pattern, query):
         intent = "product_query"
     else:
@@ -41,14 +41,10 @@ def identify_product(state: ChatbotState) -> Dict[str, Any]:
     if state["intent"] != "product_query":
         return {"resolved_product_mpn": None}
 
-    query = state["query"].lower()
-    resolved_mpn = None
-    
-    # Match specific MPNs
-    if "pdsh4816af" in query or "frigidaire" in query:
-        resolved_mpn = "PDSH4816AF"
-    elif "wdts7024rz" in query or "whirlpool" in query:
-        resolved_mpn = "WDTS7024RZ"
+    query = state["query"]
+    candidates = re.findall(r"\b[A-Z0-9][A-Z0-9_-]{5,}\b", query.upper())
+    candidates.sort(key=lambda candidate: (not any(character.isdigit() for character in candidate), -len(candidate)))
+    resolved_mpn = candidates[0] if candidates else None
         
     return {"resolved_product_mpn": resolved_mpn}
 
@@ -56,14 +52,12 @@ def identify_product(state: ChatbotState) -> Dict[str, Any]:
 def retrieve_evidence(state: ChatbotState) -> Dict[str, Any]:
     """Retrieve document specifications matching the query context from Qdrant vector DB."""
     mpn = state["resolved_product_mpn"]
-    if not mpn:
-        return {"retrieved_evidence": []}
-        
     client = get_qdrant_service()
-    
-    # Retrieve chunks related to the user's specific query filtered by MPN
     hits = client.retrieve(query=state["query"], mfg_part_num=mpn, limit=4)
-    return {"retrieved_evidence": hits}
+    resolved = mpn or (hits[0].get("mfg_part_num") if hits else None)
+    if resolved and not mpn:
+        hits = client.retrieve(query=state["query"], mfg_part_num=resolved, limit=4)
+    return {"retrieved_evidence": hits, "resolved_product_mpn": resolved}
 
 
 def generate_answer(state: ChatbotState) -> Dict[str, Any]:
@@ -79,8 +73,10 @@ def generate_answer(state: ChatbotState) -> Dict[str, Any]:
         return {"answer": ans, "verified": True}
         
     if not mpn:
-        ans = "I identified that you're asking about dishwashers, but could you please specify if you're asking about the Frigidaire (PDSH4816AF) or Whirlpool (WDTS7024RZ) model?"
-        return {"answer": ans, "verified": True}
+        return {"answer": "Please include the manufacturer part number so I can retrieve the correct product evidence.", "verified": True}
+
+    if not evidence:
+        return {"answer": f"No manufacturer evidence was found for {mpn}. I cannot verify that specification from the indexed documents.", "verified": False}
 
     # Setup evidence citation map
     citations = []
@@ -119,73 +115,38 @@ INSTRUCTIONS:
                 contents=prompt,
                 config={"temperature": 0.2}
             )
-            return {"answer": response.text, "verified": True}
+            return {"answer": response.text, "verified": bool(citations)}
         except Exception as e:
             logger.error(f"Gemini chatbot execution failed ({e}). Falling back to template generation.")
 
-    # Template fallback
-    # Generate structured answer summarizing facts about the dishwasher
-    name_display = "Frigidaire PDSH4816AF Built-In Dishwasher" if mpn == "PDSH4816AF" else "Whirlpool WDTS7024RZ Built-In Dishwasher"
-    
-    # Simple keyword extraction to answer the question
-    q_lower = query.lower()
-    
-    lines = [f"### {name_display} Specifications"]
-    
-    if "confidence" in q_lower or "accuracy" in q_lower:
-        lines.append("- **Extraction Confidence**: 1.0 (High Grounded Evidence Score). All extracted attributes match manufacturer PDF source text.")
-        lines.append("- **Verification Status**: ✅ 100% Grounded in PDF Evidence (No invented values).")
-        
-    if "validation" in q_lower or "lov" in q_lower or "uom" in q_lower:
-        lines.append("- **LOV Compliance**: Validated against Unilog Taxonomy rules.")
-        lines.append("- **UOM Normalization**: Standardized units applied (e.g. V, A, dBA, in).")
-        
-    if "review" in q_lower or "human" in q_lower:
-        lines.append("- **Human-in-the-Loop Status**: Attribute values passing confidence (>= 0.8) and LOV checks do not require review. Fields failing twice are flagged `NEEDS_HUMAN_REVIEW`.")
-
-    if "cycle" in q_lower or "wash" in q_lower:
-        if mpn == "PDSH4816AF":
-            lines.append("- **Wash Cycles**: 5 Wash Cycles (Source: FRIGIDAIRE_PDSH4816AF_Specification_Sheet.pdf Page 1)")
-        else:
-            lines.append("- **Wash Cycles**: 5 Wash Cycles (Source: owners-manual-w11323304-revj.pdf Page 12)")
-            
-    if "volt" in q_lower or "power" in q_lower or "amp" in q_lower:
-        if mpn == "PDSH4816AF":
-            lines.append("- **Electrical Rating**: 120 V, 15 A electrical hookup (Source: FRIGIDAIRE_PDSH4816AF_Specification_Sheet.pdf Page 2)")
-        else:
-            lines.append("- **Electrical Rating**: 120 V, 15 A or 10 A requirements (Source: installation-instructions-w11323304-revG.pdf Page 8)")
-            
-    if "sound" in q_lower or "noise" in q_lower or "db" in q_lower:
-        if mpn == "PDSH4816AF":
-            lines.append("- **Sound Level**: 47 dBA (Source: FRIGIDAIRE_PDSH4816AF_Specification_Sheet.pdf Page 1)")
-        else:
-            lines.append("- **Sound Level**: 41 dBA (Source: owners-manual-w11323304-revj.pdf Page 5)")
-
-    if "depth" in q_lower or "door" in q_lower or "open" in q_lower:
-        if mpn == "PDSH4816AF":
-            lines.append("- **Depth With Door Open 90 Degrees**: 50-1/4 in (Source: FRIGIDAIRE_PDSH4816AF_Specification_Sheet.pdf Page 2)")
-        else:
-            lines.append("- **Depth With Door Open 90 Degrees**: 50-3/16 in (Source: installation-instructions-w11323304-revG.pdf Page 4)")
-
-    if "mounting" in q_lower or "mount" in q_lower:
-        if mpn == "PDSH4816AF":
-            lines.append("- **Mounting Type**: Leg Mounting (Source: FRIGIDAIRE_PDSH4816AF_Specification_Sheet.pdf Page 1)")
-        else:
-            lines.append("- **Mounting Type**: Built-in (Source: installation-instructions-w11323304-revG.pdf Page 2)")
-
-    # If no specific key triggered, dump retrieved text chunks
-    if len(lines) == 1:
-        lines.append("Here is what was found in the manufacturer documents:")
-        for chunk in evidence[:2]:
-            lines.append(f"- *\"{chunk['text']}\"* (Source: **{chunk['source']}**, Page **{chunk['page_num']}**)")
-            
-    ans = "\n".join(lines)
-    return {"answer": ans, "verified": True}
+    lines = [f"### Evidence for {mpn}", "The indexed manufacturer evidence contains:"]
+    for chunk in evidence[:4]:
+        source = chunk.get("source", "unknown source")
+        page = chunk.get("page_num", "?")
+        lines.append(f"- {chunk.get('text', '').strip()} _(Source: {source}, Page {page})_")
+    return {"answer": "\n".join(lines), "verified": bool(citations)}
 
 
 def verify_answer(state: ChatbotState) -> Dict[str, Any]:
     """Ensures answer stays grounded. Checks that answer does not include external references."""
-    # General queries and verified templates are accepted directly
+    if state["intent"] == "general_query":
+        return {"verified": True}
+    answer = state.get("answer", "")
+    evidence = state.get("retrieved_evidence", [])
+    citations_present = all(
+        str(chunk.get("source", "unknown source")) in answer and
+        f"Page {chunk.get('page_num', '?')}" in answer
+        for chunk in evidence[:4]
+    )
+    if not answer or not citations_present:
+        citations = " ".join(
+            f"({chunk.get('source', 'unknown source')}, Page {chunk.get('page_num', '?')})"
+            for chunk in state.get("retrieved_evidence", [])[:4]
+        )
+        return {
+            "answer": f"I could not verify a complete answer from the indexed manufacturer evidence. {citations}".strip(),
+            "verified": False,
+        }
     return {"verified": True}
 
 

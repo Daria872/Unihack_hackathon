@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 import numpy as np
@@ -110,7 +112,8 @@ class QdrantDBService:
             text_content = el.text
             page_num = el.page_num
             element_type = el.element_type
-            source = el.metadata.get("source", "unknown")
+            metadata = dict(el.metadata)
+            source = metadata.get("source", "unknown")
             
             vector = self._get_embedding(text_content)
             
@@ -122,10 +125,13 @@ class QdrantDBService:
                     vector=vector,
                     payload={
                         "mfg_part_num": mfg_part_num,
+                        "mfg_part_num_normalized": mfg_part_num.strip().casefold(),
                         "text": text_content,
                         "page_num": page_num,
                         "element_type": element_type,
                         "source": source,
+                        "metadata": metadata,
+                        "chunk_id": idx,
                     }
                 )
             )
@@ -141,17 +147,17 @@ class QdrantDBService:
         mfg_part_num: str | None = None,
         limit: int = 5,
     ) -> List[Dict[str, Any]]:
-        """Retrieve chunks from vector store using semantic search, option filtered by Part Number."""
+        """Fuse semantic similarity with lexical and normalized MPN matching."""
         query_vector = self._get_embedding(query)
         
-        # Build filter by part number if supplied
+        # Use Qdrant filtering where possible, then apply normalized matching below.
         qdrant_filter = None
         if mfg_part_num:
             qdrant_filter = Filter(
                 must=[
                     FieldCondition(
-                        key="mfg_part_num",
-                        match=MatchValue(value=mfg_part_num)
+                        key="mfg_part_num_normalized",
+                        match=MatchValue(value=mfg_part_num.strip().casefold())
                     )
                 ]
             )
@@ -161,7 +167,7 @@ class QdrantDBService:
                 collection_name=COLLECTION_NAME,
                 query=query_vector,
                 query_filter=qdrant_filter,
-                limit=limit,
+                limit=max(limit * 5, 20),
             )
             results = getattr(response, "points", response)
         elif hasattr(self.client, "search"):
@@ -169,22 +175,38 @@ class QdrantDBService:
                 collection_name=COLLECTION_NAME,
                 query_vector=query_vector,
                 query_filter=qdrant_filter,
-                limit=limit,
+                limit=max(limit * 5, 20),
             )
         else:
             results = []
 
-        hits = []
+        query_terms = set(re.findall(r"[a-z0-9]+", query.lower()))
+        normalized_mpn = (mfg_part_num or "").strip().casefold()
+        scored_hits = []
         for hit in results:
-            hits.append({
-                "text": hit.payload.get("text", ""),
-                "page_num": hit.payload.get("page_num", 1),
-                "element_type": hit.payload.get("element_type", "paragraph"),
-                "source": hit.payload.get("source", "unknown"),
-                "score": hit.score,
-                "mfg_part_num": hit.payload.get("mfg_part_num", ""),
-            })
-        return hits
+            payload = hit.payload or {}
+            candidate_mpn = str(payload.get("mfg_part_num", ""))
+            if normalized_mpn and candidate_mpn.strip().casefold() != normalized_mpn:
+                continue
+            text = str(payload.get("text", ""))
+            text_terms = set(re.findall(r"[a-z0-9]+", text.casefold()))
+            lexical_score = len(query_terms & text_terms) / max(len(query_terms), 1)
+            mpn_score = 1.0 if normalized_mpn and normalized_mpn in candidate_mpn.casefold() else 0.0
+            semantic_score = float(getattr(hit, "score", 0.0) or 0.0)
+            hybrid_score = 0.65 * semantic_score + 0.25 * lexical_score + 0.10 * mpn_score
+            scored_hits.append((hybrid_score, {
+                "text": text,
+                "page_num": payload.get("page_num", 1),
+                "element_type": payload.get("element_type", "paragraph"),
+                "source": payload.get("source", "unknown"),
+                "metadata": payload.get("metadata", {}),
+                "chunk_id": payload.get("chunk_id"),
+                "score": semantic_score,
+                "hybrid_score": hybrid_score,
+                "mfg_part_num": candidate_mpn,
+            }))
+        scored_hits.sort(key=lambda item: item[0], reverse=True)
+        return [hit for _, hit in scored_hits[:limit]]
 
 
 _client_instance: QdrantDBService | None = None
@@ -193,7 +215,8 @@ def get_qdrant_service() -> QdrantDBService:
     global _client_instance
     if _client_instance is None:
         # For serverless dev/testing, we can set memory or storage
-        db_path = Path(__file__).resolve().parents[3] / "tmp" / "qdrant_db"
+        configured_path = os.environ.get("UNILOG_QDRANT_PATH")
+        db_path = Path(configured_path) if configured_path else Path(__file__).resolve().parents[3] / "tmp" / "qdrant_db"
         _client_instance = QdrantDBService(path=str(db_path))
     return _client_instance
 

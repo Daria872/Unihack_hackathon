@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -10,7 +11,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from fastapi import APIRouter, BackgroundTasks, File, UploadFile, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 from app.models.product_input import ProductInput
 from app.services.ingestion.excel import ingest_excel
@@ -231,6 +232,15 @@ async def run_enrichment_background(job_id: str, products_list: List[ProductInpu
         logger.warning(f"Could not clear temporary folders: {cleanup_err}")
 
 
+def run_enrichment_background_thread(
+    job_id: str,
+    products_list: List[ProductInput],
+    cleanup_dir: Path,
+) -> None:
+    """Run blocking document/embedding work outside FastAPI's event loop."""
+    asyncio.run(run_enrichment_background(job_id, products_list, cleanup_dir))
+
+
 @router.post("/upload")
 def upload_catalog(
     background_tasks: BackgroundTasks,
@@ -271,7 +281,7 @@ def upload_catalog(
     }
     
     # Launch background job
-    background_tasks.add_task(run_enrichment_background, job_id, products_list, temp_dir)
+    background_tasks.add_task(run_enrichment_background_thread, job_id, products_list, temp_dir)
     
     return {"job_id": job_id, "total_rows": len(products_list)}
 
@@ -325,6 +335,65 @@ def get_review_queue() -> List[Dict[str, Any]]:
                     "org_row": product.get("_original_row")
                 })
     return queue
+
+
+@router.get("/evidence/{mfg_part_num}")
+def get_product_evidence(mfg_part_num: str, query: str = "product specifications") -> List[Dict[str, Any]]:
+    """Return cited manufacturer chunks for the dashboard evidence viewer."""
+    if not mfg_part_num.strip():
+        raise HTTPException(status_code=400, detail="Manufacturer part number is required")
+    try:
+        return get_qdrant_service().retrieve(query=query, mfg_part_num=mfg_part_num, limit=12)
+    except Exception:
+        logger.exception("Evidence retrieval failed for MPN %s", mfg_part_num)
+        raise HTTPException(status_code=503, detail="Evidence service is temporarily unavailable")
+
+
+@router.get("/search")
+def search_products(query: str, job_id: str | None = None) -> List[Dict[str, Any]]:
+    """Search only indexed pipeline results; never fabricate a match."""
+    needle = query.strip().casefold()
+    if not needle:
+        return []
+    matches = []
+    sources = {job_id: products_db.get(job_id, [])} if job_id else products_db
+    for current_job_id, rows in sources.items():
+        for product in rows:
+            searchable = " ".join(str(value) for key, value in product.items() if not key.startswith("_") and value)
+            if needle in searchable.casefold():
+                matches.append({"job_id": current_job_id, "product": product})
+    return matches[:100]
+
+
+def _pdf_escape(value: Any) -> str:
+    return str(value or "").replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+@router.get("/evidence/{mfg_part_num}/pdf")
+def export_product_evidence_pdf(mfg_part_num: str) -> Response:
+    """Create a dependency-free PDF containing product fields and citations."""
+    product = next((row for rows in products_db.values() for row in rows if str(row.get("Mfg_Part_Num", "")) == mfg_part_num), None)
+    if product is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+    chunks = get_product_evidence(mfg_part_num)
+    validation = product.get("_attribute_validation", {})
+    lines = [f"UNILOG AI PRODUCT EVIDENCE - {mfg_part_num}", f"Manufacturer: {product.get('MANUFACTURER_NAME', '')}", f"Brand: {product.get('BRAND_NAME', '')}", "", "ATTRIBUTES"]
+    for label, details in validation.items():
+        lines.append(f"{label}: {product.get(f'ATTRIBUTE_VALUE {list(validation).index(label) + 1}', '')} | confidence {float(details.get('confidence', 0)) * 100:.0f}% | validation LOV={details.get('lov')} UOM={details.get('uom')} source={details.get('source')}")
+        lines.append(f"Reason: {details.get('reason', '')}; Evidence: {details.get('evidence', '')}")
+    lines.append("")
+    lines.append("RETRIEVED SOURCES")
+    for chunk in chunks:
+        lines.append(f"{chunk.get('source', '')} - Page {chunk.get('page_num', '')}: {chunk.get('text', '')}")
+    content_lines = [f"BT /F1 9 Tf 36 806 Td ({_pdf_escape(line[:150])}) Tj 0 -14 Td" for line in lines[:55]]
+    content = ("\n".join(content_lines) + "\nET").encode("latin-1", "replace")
+    objects = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>", b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>", b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>", b"<< /Length " + str(len(content)).encode() + b" >>\nstream\n" + content + b"\nendstream"]
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for index, obj in enumerate(objects, 1):
+        offsets.append(len(pdf)); pdf.extend(f"{index} 0 obj\n".encode()); pdf.extend(obj); pdf.extend(b"\nendobj\n")
+    xref = len(pdf); pdf.extend(f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode()); pdf.extend(b"".join(f"{offset:010d} 00000 n \n".encode() for offset in offsets)); pdf.extend(f"trailer << /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF".encode())
+    return Response(bytes(pdf), media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{mfg_part_num}-evidence.pdf"'})
 
 
 @router.post("/review/approve")
@@ -393,6 +462,7 @@ def get_metrics_summary() -> Dict[str, Any]:
     evidence_backed = 0
     human_reviews = 0
     total_fields = 0
+    compliance = {"lov": {"passed": 0, "failed": 0, "total": 0}, "uom": {"passed": 0, "failed": 0, "total": 0}, "source": {"passed": 0, "failed": 0, "total": 0}}
     
     for job_id, results in products_db.items():
         for product in results:
@@ -406,7 +476,8 @@ def get_metrics_summary() -> Dict[str, Any]:
             if invoice_len <= 40 and 60 <= mobile_len <= 80:
                 char_limit_compliant += 1
                 
-            # Check attribute details
+            # Check persisted validation outcomes produced by the workflow.
+            validation = product.get("_attribute_validation", {})
             for idx in range(1, 51):
                 label = product.get(f"ATTRIBUTE_LABEL {idx}")
                 val = product.get(f"ATTRIBUTE_VALUE {idx}")
@@ -415,10 +486,15 @@ def get_metrics_summary() -> Dict[str, Any]:
                     if not val or val == "" or val == "NEEDS_HUMAN_REVIEW":
                         missing_fields += 1
                     else:
-                        evidence_backed += 1
-                        # Since we enforce LOV during pipeline, any valid non-review field is LOV compliant
-                        lov_compliant += 1
-                        uom_compliant += 1
+                        details = validation.get(label, {})
+                        evidence_backed += int(bool(details.get("source")))
+                    details = validation.get(label, {})
+                    for key in ("lov", "uom", "source"):
+                        compliance[key]["total"] += 1
+                        if details.get(key): compliance[key]["passed"] += 1
+                        else: compliance[key]["failed"] += 1
+                    lov_compliant += int(bool(details.get("lov")))
+                    uom_compliant += int(bool(details.get("uom")))
 
     human_rate = (human_reviews / total_processed) * 100 if total_processed else 0.0
     invoice_limit = (char_limit_compliant / total_processed) * 100 if total_processed else 100.0
@@ -426,15 +502,26 @@ def get_metrics_summary() -> Dict[str, Any]:
     uom_rate = (uom_compliant / total_fields) * 100 if total_fields else 100.0
     missing_rate = (missing_fields / total_fields) * 100 if total_fields else 0.0
 
+    evaluated_accuracy = 0.0
+    evaluation_report = Path(__file__).resolve().parents[3] / "evaluation" / "eval_report.json"
+    try:
+        if evaluation_report.is_file():
+            with evaluation_report.open(encoding="utf-8") as report_file:
+                evaluated_accuracy = float(json.load(report_file).get("attribute_accuracy", 0.0))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        logger.warning("Could not read evaluation report for dashboard KPIs", exc_info=True)
+
     return {
         "total_processed": total_processed,
+        "attribute_accuracy_rate": round(evaluated_accuracy, 2),
         "human_review_count": human_reviews,
         "human_review_rate": round(human_rate, 2),
         "lov_compliance_rate": round(lov_rate, 2),
         "uom_compliance_rate": round(uom_rate, 2),
         "description_limit_rate": round(invoice_limit, 2),
         "missing_field_rate": round(missing_rate, 2),
-        "evidence_backed_rate": round((evidence_backed / total_fields) * 100 if total_fields else 100.0, 2)
+        "evidence_backed_rate": round((evidence_backed / total_fields) * 100 if total_fields else 0.0, 2),
+        "compliance": compliance,
     }
 
 

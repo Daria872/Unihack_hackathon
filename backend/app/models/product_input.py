@@ -24,4 +24,7 @@ class ProductInput(BaseModel):
     unilog_brand: str | None
     dib_brand: str | None
     part_manuf: str | None
+    specification_sheet: str | None = None
+    ref_url_1: str | None = None
+    ref_url_2: str | None = None
     raw: ProductInputRaw = Field(default_factory=ProductInputRaw)

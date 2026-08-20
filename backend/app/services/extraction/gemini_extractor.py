@@ -72,17 +72,12 @@ class GeminiAttributeExtractor:
                     }
                 )
                 
-                parsed_response = json.loads(response.text)
-                attributes = []
-                for attr_dict in parsed_response.get("attributes", []):
-                    attributes.append(
-                        ExtractedAttribute(
-                            name=attr_dict.get("name"),
-                            value=attr_dict.get("value"),
-                            confidence=float(attr_dict.get("confidence", 0.0)),
-                            source_evidence=attr_dict.get("source_evidence")
-                        )
-                    )
+                parsed_response = ExtractionResponse.model_validate(json.loads(response.text))
+                allowed = set(allowed_attributes)
+                attributes = [
+                    attr for attr in parsed_response.attributes
+                    if attr.name in allowed and self._evidence_is_grounded(attr.source_evidence, retrieved_chunks)
+                ]
                 logger.info(f"Gemini extracted {len(attributes)} attributes for MPN: {mfg_part_num}")
                 return attributes
             except Exception as e:
@@ -90,6 +85,14 @@ class GeminiAttributeExtractor:
 
         # Heuristic fallback (works offline and parses the dishwasher examples perfectly)
         return self._heuristic_extract(mfg_part_num, allowed_attributes, retrieved_chunks)
+
+    @staticmethod
+    def _evidence_is_grounded(evidence: str, chunks: List[Dict[str, Any]]) -> bool:
+        evidence_text = " ".join(evidence.split()).casefold()
+        return bool(evidence_text) and any(
+            evidence_text in " ".join(str(chunk.get("text", "")).split()).casefold()
+            for chunk in chunks
+        )
 
     def _build_prompt(
         self,

@@ -84,7 +84,13 @@ pip install -r requirements.txt
 
 ### 3. Frontend Build
 ```bash
-cd frontend
+npm --prefix frontend/industrial-ai-dashboard install
+npm --prefix frontend/industrial-ai-dashboard run build
+```
+
+On Windows PowerShell, the equivalent is:
+```powershell
+cd frontend\industrial-ai-dashboard
 npm install
 npm run build
 ```
@@ -97,11 +103,11 @@ npm run build
 Build the frontend, then start FastAPI to serve both API routes and static frontend bundle from `http://localhost:8000`:
 ```bash
 # Build frontend static files
-cd frontend
+cd frontend/industrial-ai-dashboard
 npm run build
 
 # Run FastAPI backend
-cd ../backend
+cd ../../backend
 uvicorn app.main:app --reload --port 8000
 ```
 Open **`http://localhost:8000`** in your browser.
@@ -115,12 +121,23 @@ Run backend and frontend dev servers in separate terminal tabs:
   uvicorn app.main:app --reload --port 8000
   ```
 
-- **Terminal 2 (Vite Frontend)**:
+- **Terminal 2 (Next.js Frontend)**:
   ```bash
-  cd frontend
+  cd frontend/industrial-ai-dashboard
   npm run dev
   ```
-Open **`http://localhost:5173`** in your browser.
+Open **`http://localhost:3000`** in your browser. Set `NEXT_PUBLIC_BACKEND_URL` if the API is not at `http://localhost:8000`.
+
+The dashboard includes catalog upload, job progress and logs, product results, cited evidence, live KPI metrics, human-review queue, and the Product Intelligence chatbot. Select a result row to open its document/page evidence.
+
+### Chatbot API
+```bash
+curl -X POST http://localhost:8000/api/chatbot/ask ^
+  -H "Content-Type: application/json" ^
+  -d "{\"query\":\"What is the sound level for PDSH4816AF?\"}"
+```
+
+The chatbot follows intent classification, MPN identification, hybrid evidence retrieval, answer generation, and citation verification. It reports when evidence is unavailable instead of inventing a specification.
 
 ---
 
@@ -156,6 +173,15 @@ This generates **`evaluation/eval_report.json`** summarizing:
 - Missing Field Rate
 - Evidence-Backed Grounding Rate
 - Human-Review Rate
+
+The evaluator reads the supplied input and delivery-format reference files without modifying them. LOV and UOM compliance are calculated through the deterministic reference-data service; the generated report is written to `evaluation/eval_report.json`.
+
+### Operational diagnostics
+
+- FastAPI logs errors with stack traces server-side and returns a generic service error to clients.
+- Check `http://localhost:8000/health` before starting a dashboard run.
+- A failed background row is logged and does not stop subsequent catalog rows.
+- Missing evidence or repeated validation failure produces `NEEDS_HUMAN_REVIEW` in the delivery output.
 
 ---
 

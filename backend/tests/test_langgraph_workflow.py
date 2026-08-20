@@ -210,3 +210,35 @@ def test_retry_and_human_review_paths() -> None:
             found_review_field = True
             break
     assert found_review_field is True
+
+
+def test_corrective_attempt_can_clear_previous_review() -> None:
+    state: EnrichmentState = {
+        "product_input": {"mfg_part_num": "ABC", "part_desc": "Widget"},
+        "manufacturer_name": "Acme",
+        "brand_name": "Acme",
+        "mfg_part_num": "ABC",
+        "part_desc": "Widget",
+        "classpath": "General",
+        "retrieval_query": "",
+        "evidence_chunks": [],
+        "extracted_attributes": {"Voltage Rating": "120"},
+        "attribute_evidence": {"Voltage Rating": "Voltage Rating: 120 V"},
+        "attribute_confidence": {"Voltage Rating": 1.0},
+        "validated_attributes": {},
+        "attribute_uoms": {},
+        "retry_count": 1,
+        "fields_needing_review": ["Voltage Rating"],
+        "needs_retry": True,
+        "invoice_desc": None,
+        "mobile_desc": None,
+        "short_desc": None,
+        "long_desc1": None,
+        "retail_desc": None,
+        "marketing_description": None,
+        "final_output": {},
+    }
+
+    refreshed = retrieve_evidence(state)
+
+    assert refreshed["fields_needing_review"] == []

@@ -15,6 +15,7 @@ from app.models.product_input import ProductInput
 from app.services.ingestion.excel import ingest_excel
 from app.services.enrichment.workflow import enrich_product
 from app.services.retrieval.qdrant_db import get_qdrant_service
+from app.services.retrieval import reference as ref_service
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -105,7 +106,9 @@ def score_results(outputs: list[dict], gt_df: pd.DataFrame) -> dict:
     correct_attrs = 0
     
     lov_valid_count = 0
+    lov_total = 0
     uom_valid_count = 0
+    uom_total = 0
     
     desc_compliant_count = 0
     missing_fields_count = 0
@@ -171,8 +174,15 @@ def score_results(outputs: list[dict], gt_df: pd.DataFrame) -> dict:
                     missing_fields_count += 1
                 else:
                     evidence_backed_count += 1
-                    lov_valid_count += 1
-                    uom_valid_count += 1
+                    classpath = output.get("Classpath")
+                    lov_total += 1
+                    if ref_service.validate_lov_value(classpath, label, str(val)):
+                        lov_valid_count += 1
+                    uom_total += 1
+                    combined_uom = f"{val} {uom}".strip()
+                    normalized = ref_service.normalize_uom(combined_uom) if uom else None
+                    if not uom or normalized is not None:
+                        uom_valid_count += 1
 
     cell_acc = round((correct_cells / total_cells) * 100, 2) if total_cells else 100.0
     attr_acc = round((correct_attrs / total_attrs) * 100, 2) if total_attrs else 100.0
@@ -183,8 +193,8 @@ def score_results(outputs: list[dict], gt_df: pd.DataFrame) -> dict:
     )
     total_attr_slots = sum(1 for o in outputs for idx in range(1, 51) if o.get(f"ATTRIBUTE_LABEL {idx}"))
     
-    lov_rate = 99.85
-    uom_rate = 100.0
+    lov_rate = round((lov_valid_count / lov_total) * 100, 2) if lov_total else 100.0
+    uom_rate = round((uom_valid_count / uom_total) * 100, 2) if uom_total else 100.0
     missing_rate = round(((total_attr_slots - total_populated_attrs) / total_attr_slots) * 100, 2) if total_attr_slots else 0.0
     evidence_rate = round((total_populated_attrs / total_attr_slots) * 100, 2) if total_attr_slots else 100.0
     
@@ -193,8 +203,8 @@ def score_results(outputs: list[dict], gt_df: pd.DataFrame) -> dict:
 
     return {
         "total_evaluated": total_evaluated,
-        "overall_cell_accuracy": cell_acc if cell_acc > 0 else 94.85,
-        "attribute_accuracy": attr_acc if attr_acc > 0 else 96.2,
+        "overall_cell_accuracy": cell_acc,
+        "attribute_accuracy": attr_acc,
         "lov_compliance_rate": lov_rate,
         "uom_compliance_rate": uom_rate,
         "desc_limit_compliance": desc_limit_rate,

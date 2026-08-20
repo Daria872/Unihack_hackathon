@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import pytest
 
-from app.services.ingestion.pdf import PDFProcessor, PDFElement
+from app.services.ingestion.pdf import PDFProcessor, PDFElement, chunk_pdf_elements
 from app.services.retrieval.qdrant_db import QdrantDBService, DeterministicEmbedder
 from app.services.extraction.gemini_extractor import GeminiAttributeExtractor, ExtractedAttribute
 from app.api.pipeline import make_dummy_pdf
@@ -149,3 +149,53 @@ def test_attribute_extractor_never_invents_unsupported_attributes() -> None:
     assert "Horsepower" not in extracted_names
     assert "BTU Rating" not in extracted_names
     assert "Color" in extracted_names
+
+
+def test_pdf_chunking_retains_page_and_provenance() -> None:
+    element = PDFElement(
+        text="word " * 500,
+        page_num=7,
+        element_type="table",
+        metadata={"source": "manual.pdf", "table_data": "| A | B |"},
+    )
+
+    chunks = chunk_pdf_elements([element], max_chars=100, overlap=20)
+
+    assert len(chunks) > 1
+    assert all(chunk.page_num == 7 for chunk in chunks)
+    assert all(chunk.metadata["source"] == "manual.pdf" for chunk in chunks)
+    assert all(chunk.element_type == "table" for chunk in chunks)
+    assert chunks[0].text.split()[-1] in chunks[1].text
+
+
+def test_qdrant_hybrid_search_uses_lexical_match_and_normalized_mpn() -> None:
+    db = QdrantDBService(location=":memory:")
+    db.index_pdf_elements("ABC-123", [
+        PDFElement("Voltage rating: 120 V", 1, "paragraph", {"source": "a.pdf"}),
+        PDFElement("The product has a quiet stainless steel finish", 2, "paragraph", {"source": "a.pdf"}),
+    ])
+
+    results = db.retrieve("stainless steel finish", mfg_part_num="abc-123", limit=1)
+
+    assert len(results) == 1
+    assert "stainless steel" in results[0]["text"].lower()
+    assert results[0]["hybrid_score"] >= 0
+
+
+def test_gemini_response_validation_rejects_ungrounded_attributes() -> None:
+    extractor = GeminiAttributeExtractor()
+
+    class FakeModels:
+        def generate_content(self, **_: object) -> object:
+            return type("Response", (), {"text": '{"attributes": [{"name": "Voltage Rating", "value": "240", "confidence": 1.0, "source_evidence": "Voltage Rating: 240 V"}]}'})()
+
+    extractor.client = type("Client", (), {"models": FakeModels()})()
+    extracted = extractor.extract_attributes(
+        product_desc="Widget",
+        mfg_part_num="ABC-123",
+        classpath="General",
+        allowed_attributes=["Voltage Rating"],
+        retrieved_chunks=[{"text": "Voltage Rating: 120 V", "page_num": 1, "source": "a.pdf"}],
+    )
+
+    assert extracted == []

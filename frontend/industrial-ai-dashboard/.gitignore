@@ -13,3 +13,6 @@ __v0_jsx-dev-runtime.ts
 node_modules
 .next/
 .DS_Store
+
+# Local duplicate checkout, not part of the dashboard source
+unilog-product-intelligence/

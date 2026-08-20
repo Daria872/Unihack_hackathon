@@ -37,3 +37,8 @@ build/
 
 # Docker
 *.log
+
+# Temporary & Archives
+*.zip
+tmp/
+

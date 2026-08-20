@@ -43,13 +43,20 @@ def ingest_excel(
     if not path.is_file():
         raise FileNotFoundError(f"Input workbook not found: {path}")
 
-    frame = pd.read_excel(
-        path,
-        sheet_name=sheet_name,
-        engine="openpyxl",
-        dtype=object,
-        header=0,
-    )
+    try:
+        frame = pd.read_excel(
+            path,
+            sheet_name=sheet_name,
+            engine="openpyxl",
+            dtype=object,
+            header=0,
+        )
+    except Exception:
+        frame = pd.read_csv(
+            path,
+            dtype=object,
+            header=0,
+        )
     frame.columns = [str(column).strip() for column in frame.columns]
     _validate_required_columns(frame.columns)
 

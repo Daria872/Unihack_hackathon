@@ -1,0 +1,11 @@
+{
+  "total_evaluated": 1000,
+  "overall_cell_accuracy": 84.72,
+  "attribute_accuracy": 87.0,
+  "lov_compliance_rate": 0.11,
+  "uom_compliance_rate": 0.11,
+  "desc_limit_compliance": 0.2,
+  "missing_field_rate": 0.09,
+  "evidence_backed_rate": 0.11,
+  "human_review_rate": 0.2
+}

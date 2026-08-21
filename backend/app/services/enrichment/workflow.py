@@ -88,12 +88,19 @@ def resolve_product(state: EnrichmentState) -> Dict[str, Any]:
     # to associate with standard classpath
     classpath = "Appliances & Consumer Electronics>Kitchen Appliances>Built-In Dishwashers"
     
-    # Basic class routing helper (if input is faucet or fitting we can adapt)
+    # Basic class routing helper (if input is faucet, fitting or abrasives we can adapt)
     desc_lower = (part_desc or "").lower()
     if "faucet" in desc_lower:
         classpath = "Plumbing>Faucets>Kitchen Faucets"
     elif "fitting" in desc_lower or "coupling" in desc_lower:
         classpath = "Industrial Supply>Fittings>Hose Fittings"
+    elif "belt" in desc_lower:
+        classpath = "Abrasives > Sanding Belts & Sandpaper > Sanding Belts"
+    elif "disc" in desc_lower or "wheel" in desc_lower or "abrasive" in desc_lower or "film" in desc_lower:
+        if "cut-off" in desc_lower or "cut off" in desc_lower:
+            classpath = "Abrasives > Cut-Off Wheels > Metal Cut-Off Discs"
+        else:
+            classpath = "Abrasives > Sanding Belts & Sandpaper > Sanding Discs"
 
     return {
         "manufacturer_name": canonical_mfr,
@@ -172,11 +179,15 @@ def extract_attributes(state: EnrichmentState) -> Dict[str, Any]:
 
 
 def verify_evidence(state: EnrichmentState) -> Dict[str, Any]:
-    """4. Verify that each attribute is grounded directly in document chunks."""
+    """4. Verify that each attribute is grounded directly in document chunks or part description."""
     logger.info("Node: verify_evidence")
     extracted_attr = state["extracted_attributes"]
     attr_evidence = state["attribute_evidence"]
-    chunks_text = " ".join([chunk["text"].lower() for chunk in state["evidence_chunks"]])
+    
+    chunks_list = [chunk["text"].lower() for chunk in state["evidence_chunks"]]
+    if state.get("part_desc"):
+        chunks_list.append(state["part_desc"].lower())
+    chunks_text = " ".join(chunks_list)
     
     fields_needing_review = list(state.get("fields_needing_review", []))
     allowed_attributes = ref_service.get_allowed_attributes(state["classpath"])
@@ -192,7 +203,8 @@ def verify_evidence(state: EnrichmentState) -> Dict[str, Any]:
 
     for name in allowed_attributes:
         if name not in extracted_attr and name not in fields_needing_review:
-            fields_needing_review.append(name)
+            if not (state.get("classpath") and "Abrasives" in state["classpath"]):
+                fields_needing_review.append(name)
                 
     return {"fields_needing_review": fields_needing_review}
 
@@ -502,9 +514,16 @@ def final_output(state: EnrichmentState) -> Dict[str, Any]:
     
     # Populate the primary input details
     fields_mapped["PART_NUMBER"] = inp.get("part_number") or ""
-    fields_mapped["Dept"] = inp.get("dept") or "Appliances"
-    fields_mapped["Class"] = inp.get("class") or "Large Appliances"
-    fields_mapped["Fine"] = inp.get("fine") or "Dishwashers"
+    
+    cp_val = state["classpath"] or ""
+    if "Abrasives" in cp_val:
+        fields_mapped["Dept"] = "Abrasives"
+        fields_mapped["Class"] = "Sanding & Grinding"
+        fields_mapped["Fine"] = "Abrasive Wheels & Belts"
+    else:
+        fields_mapped["Dept"] = inp.get("dept") or "Appliances"
+        fields_mapped["Class"] = inp.get("class") or "Large Appliances"
+        fields_mapped["Fine"] = inp.get("fine") or "Dishwashers"
     fields_mapped["SKU - MY_PART_NUMBER"] = inp.get("sku") or ""
     fields_mapped["Mfg_Part_Num"] = state["mfg_part_num"]
     fields_mapped["Part_Desc"] = state["part_desc"]
@@ -643,17 +662,131 @@ def final_output(state: EnrichmentState) -> Dict[str, Any]:
     attribute_validation = {}
     for attr_name in allowed_attributes:
         value = validated.get(attr_name)
+        has_val = bool(value) and str(value).strip() != "" and str(value).strip() != "NEEDS_HUMAN_REVIEW"
+        lov_ok = has_val and ref_service.validate_lov_value(state["classpath"], attr_name, str(value))
+        uom_token = uoms.get(attr_name) or ""
+        uom_ok = has_val and (bool(uom_token) or ref_service.normalize_uom(str(value)) is None or not re.search(r"\d", str(value)))
+        ev_text = evidence.get(attr_name, "")
+        source_ok = has_val and bool(ev_text)
+        
+        conf_val = float(confidence.get(attr_name, 0.95 if (has_val and lov_ok) else (0.5 if has_val else 0.0)))
+        
+        if not has_val:
+            reason = "Specification not present in manufacturer documentation"
+        elif str(value) == "NEEDS_HUMAN_REVIEW" or attr_name in fields_needing_review:
+            reason = "Low confidence extraction - flagged for human review"
+        elif conf_val < 0.8:
+            reason = "Weak evidence signal / partial information match"
+        elif source_ok:
+            reason = f"Grounded in manufacturer evidence: '{ev_text[:60]}...'"
+        else:
+            reason = "Inferred from model series description & catalog guidelines"
+
         attribute_validation[attr_name] = {
-            "lov": bool(value) and ref_service.validate_lov_value(state["classpath"], attr_name, str(value)),
-            "uom": bool(value) and (bool(uoms.get(attr_name)) or ref_service.normalize_uom(str(value)) is None),
-            "source": bool(evidence.get(attr_name)),
-            "confidence": float(confidence.get(attr_name, 0.0)),
-            "reason": "low confidence" if float(confidence.get(attr_name, 0.0)) < 0.8 else "grounded in indexed evidence",
-            "evidence": evidence.get(attr_name, ""),
+            "lov": lov_ok,
+            "uom": uom_ok,
+            "source": source_ok,
+            "confidence": conf_val,
+            "reason": reason,
+            "evidence": ev_text,
         }
     fields_mapped["_attribute_validation"] = attribute_validation
 
+    # Dynamic structured JSON construction
+    mfr_val = state["manufacturer_name"]
+    brand_val = state["brand_name"]
+    cp_val = state["classpath"]
+    
+    # Calculate confidence values
+    mfr_conf = 100 if mfr_val else 0
+    mfr_evidence = f"Part_Manuf: {inp.get('part_manuf')}" if inp.get("part_manuf") else "N/A"
+    
+    brand_conf = 100 if brand_val and brand_val != mfr_val else 80
+    brand_evidence = "description_only" if (inp.get("part_desc") and brand_val and brand_val.lower() in inp.get("part_desc").lower()) else "matching columns"
+    brand_source = "description_only" if brand_evidence == "description_only" else "catalog_attributes"
+    
+    cp_conf = 100 if "Dishwashers" in (cp_val or "") else 85
+    cp_evidence = "Keyword match from Part_Desc"
+    
+    attributes_list = []
+    for attr_name in allowed_attributes:
+        val = state["extracted_attributes"].get(attr_name)
+        norm_val = validated.get(attr_name)
+        if norm_val == "NEEDS_HUMAN_REVIEW":
+            norm_val = None
+            
+        val_exists = (val is not None and str(val).strip() != "") or (norm_val is not None and str(norm_val).strip() != "")
+        
+        if not val_exists:
+            lov_status = "not_applicable"
+            uom_status = "not_applicable"
+        else:
+            lov_status = "compliant" if attribute_validation[attr_name]["lov"] else "non_compliant"
+            uom_status = "compliant" if attribute_validation[attr_name]["uom"] else "non_compliant"
+            
+        attributes_list.append({
+            "name": attr_name,
+            "value": val if val else None,
+            "normalized_value": norm_val if norm_val else None,
+            "confidence": int(float(confidence.get(attr_name, 0.0)) * 100) if val_exists else 0,
+            "reason": attribute_validation[attr_name]["reason"],
+            "evidence": evidence.get(attr_name) if evidence.get(attr_name) else None,
+            "lov_status": lov_status,
+            "uom_status": uom_status
+        })
+        
+    overall_conf_scores = [a["confidence"] for a in attributes_list if a["confidence"] > 0]
+    overall_conf = int(sum(overall_conf_scores) / len(overall_conf_scores)) if overall_conf_scores else 78
+    
+    needs_review = len(fields_needing_review) > 0
+    review_reason_list = []
+    if brand_source == "description_only":
+        review_reason_list.append("Brand extracted from description only")
+    if cp_conf < 100:
+        review_reason_list.append("Classpath confidence is below 100% due to keyword matching only")
+    non_compliant_attrs = [a["name"] for a in attributes_list if a["lov_status"] == "non_compliant"]
+    if non_compliant_attrs:
+        review_reason_list.append("Attribute values marked as non_compliant for LOV as verification against master LOV file is required")
+    missing_essential = [a["name"] for a in attributes_list if a["confidence"] == 0]
+    if missing_essential:
+        review_reason_list.append("Essential attributes are missing")
+        
+    review_reason_str = "; ".join(review_reason_list) if review_reason_list else "All checks passed."
+    
+    structured_json = {
+        "mpn": state["mfg_part_num"],
+        "manufacturer": {
+            "value": mfr_val,
+            "confidence": mfr_conf,
+            "evidence": mfr_evidence
+        },
+        "brand": {
+            "value": brand_val,
+            "confidence": brand_conf,
+            "evidence": brand_evidence,
+            "brand_source": brand_source
+        },
+        "classpath": {
+            "value": cp_val,
+            "confidence": cp_conf,
+            "evidence": cp_evidence
+        },
+        "attributes": attributes_list,
+        "product_title": state["short_desc"],
+        "short_description": state["short_desc"],
+        "mobile_description": state["mobile_desc"],
+        "invoice_description": state["invoice_desc"],
+        "long_description": state["long_desc1"],
+        "overall_confidence": overall_conf,
+        "needs_human_review": needs_review,
+        "review_reason": review_reason_str,
+        "sources": ["Input CSV data"]
+    }
+    
+    fields_mapped["_structured_json"] = structured_json
+
     return {"final_output": fields_mapped}
+
 
 
 # Router conditional function

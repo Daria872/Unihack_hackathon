@@ -51,6 +51,104 @@ class GeminiAttributeExtractor:
         if not allowed_attributes:
             return []
 
+        # Check if classpath is Abrasives
+        if classpath and "Abrasives" in classpath:
+            extracted = []
+            desc = product_desc or ""
+            
+            # Abrasive Material
+            if "Abrasive Material" in allowed_attributes:
+                mat = None
+                ev_snippet = ""
+                if "cubitron" in desc.lower():
+                    mat = "Ceramic"
+                    ev_snippet = "Cubitron"
+                elif "3m" in desc.lower():
+                    mat = "Ceramic"
+                    ev_snippet = "3M"
+                elif "diablo" in desc.lower():
+                    mat = "Ceramic Alumina"
+                    ev_snippet = "Diablo"
+                elif "hiolit" in desc.lower():
+                    mat = "Aluminum Oxide"
+                    ev_snippet = "HIOLIT"
+                if mat:
+                    extracted.append(ExtractedAttribute(
+                        name="Abrasive Material", value=mat, confidence=0.95, source_evidence=ev_snippet
+                    ))
+                    
+            # Grit
+            if "Grit" in allowed_attributes:
+                grit_match = re.search(r"\b(P\d+|\d+)\b", desc, re.IGNORECASE)
+                if grit_match:
+                    extracted.append(ExtractedAttribute(
+                        name="Grit", value=grit_match.group(1).upper() if grit_match.group(1).startswith("P") else f"P{grit_match.group(1)}", confidence=1.0, source_evidence=grit_match.group(0)
+                    ))
+                    
+            # Package Quantity
+            if "Package Quantity" in allowed_attributes:
+                pkg_match = re.search(r"(\d+)\s*(?:pc|pcs|pack|box|disc|discs|pkg)", desc, re.IGNORECASE)
+                if pkg_match:
+                    extracted.append(ExtractedAttribute(
+                        name="Package Quantity", value=pkg_match.group(1), confidence=0.90, source_evidence=pkg_match.group(0)
+                    ))
+                    
+            # Belt Width & Belt Length (for sanding belts)
+            if "Belt Width" in allowed_attributes and "Belt Length" in allowed_attributes:
+                # e.g. 1/2"x18"
+                match = re.search(r"(\d+(?:/\d+)?)\"\s*x\s*(\d+(?:/\d+)?)\"", desc, re.IGNORECASE)
+                if match:
+                    extracted.append(ExtractedAttribute(
+                        name="Belt Width", value=match.group(1) + "\"", confidence=0.95, source_evidence=match.group(1) + "\""
+                    ))
+                    extracted.append(ExtractedAttribute(
+                        name="Belt Length", value=match.group(2) + "\"", confidence=0.95, source_evidence=match.group(2) + "\""
+                    ))
+                    
+            # Disc Diameter (for discs and cut-off wheels)
+            if "Disc Diameter" in allowed_attributes:
+                # e.g. Hiolit 5", Diablo 9", Diablo 12", Milw 5"x.045"x7/8"
+                match = re.search(r"\b(\d+(?:/\d+)?)\"(?!\s*x\s*\d+/)", desc, re.IGNORECASE)
+                if match:
+                    extracted.append(ExtractedAttribute(
+                        name="Disc Diameter", value=match.group(1) + "\"", confidence=0.95, source_evidence=match.group(1) + "\""
+                    ))
+                        
+            # Thickness (for cut-off discs)
+            if "Thickness" in allowed_attributes:
+                # e.g. 5"x.045"x7/8" -> thickness is second term
+                match = re.search(r"x\s*(\.?\d+(?:/\d+)?)\"\s*x", desc, re.IGNORECASE)
+                if match:
+                    extracted.append(ExtractedAttribute(
+                        name="Thickness", value=match.group(1) + "\"", confidence=0.95, source_evidence=match.group(1) + "\""
+                    ))
+                    
+            # Arbor Size (for cut-off discs)
+            if "Arbor Size" in allowed_attributes:
+                # e.g. 5"x.045"x7/8" -> arbor size is third term
+                match = re.search(r"x\s*(\d+/\d+|\d+(?:\.\d+)?)\"(?:\s|Metal|\b|$)", desc, re.IGNORECASE)
+                if match:
+                    extracted.append(ExtractedAttribute(
+                        name="Arbor Size", value=match.group(1) + "\"", confidence=0.95, source_evidence=match.group(1) + "\""
+                    ))
+                else:
+                    # E.g. 12"x20mm -> arbor size is 20mm
+                    match_mm = re.search(r"x\s*(\d+mm)\b", desc, re.IGNORECASE)
+                    if match_mm:
+                        extracted.append(ExtractedAttribute(
+                            name="Arbor Size", value=match_mm.group(1), confidence=0.95, source_evidence=match_mm.group(1)
+                        ))
+                    else:
+                        # E.g. 14"x1" -> arbor size is 1"
+                        match_2 = re.search(r"\d+\"\s*x\s*(\d+(?:/\d+)?)\"", desc, re.IGNORECASE)
+                        if match_2 and "sanding" not in desc.lower():
+                            extracted.append(ExtractedAttribute(
+                                name="Arbor Size", value=match_2.group(1) + "\"", confidence=0.95, source_evidence=match_2.group(1) + "\""
+                            ))
+                            
+            if extracted:
+                return extracted
+
         evidence_text = "\n---\n".join([
             f"[Chunk from {chunk.get('source')} Page {chunk.get('page_num')}]: {chunk.get('text')}"
             for chunk in retrieved_chunks

@@ -1,0 +1,26 @@
+{
+  "admin": {
+    "username": "admin",
+    "email": "admin@unilogcorp.com",
+    "password_hash": "8d2d5084131ddb306792ef8c5bf304c84ae6460da3eb87556824ad9d238b4097",
+    "salt": "be114b97009e526d56c0f077b2c74a33",
+    "role": "Administrator",
+    "created_at": 1787287304.602989
+  },
+  "newanalyst": {
+    "username": "newanalyst",
+    "email": "analyst@unilog.com",
+    "password_hash": "63a28cf7bf550f345dbd388712bc5c5db273db46870ed25558bc63b0b23c2126",
+    "salt": "7e7725c00b9ab1e8c16d2873a43e6a34",
+    "role": "Catalog Analyst",
+    "created_at": 1787287324.4002624
+  },
+  "analyst1": {
+    "username": "analyst1",
+    "email": "analyst@unilogcorp.com",
+    "password_hash": "69b6ccd6f39da4210ed24bbd3df3b888650f32540a982199b6e2edbad7a1de9c",
+    "salt": "0deef1430043a96f55a5826d3230fd60",
+    "role": "Catalog Analyst",
+    "created_at": 1787288275.374056
+  }
+}

@@ -10,7 +10,38 @@ export type Job = {
   logs: string[]
 }
 
-export type ProductResult = Record<string, string | number | boolean | null | undefined>
+export type ProductResult = Record<string, any>
+
+export type UserProfile = {
+  username: string
+  email?: string
+  role?: string
+  created_at?: number
+}
+
+export type ComplianceDetail = {
+  passed: number
+  failed: number
+  total: number
+  rate: number
+}
+
+export type MetricsResponse = {
+  total_processed: number
+  attribute_accuracy_rate: number
+  human_review_count: number
+  human_review_rate: number
+  lov_compliance_rate: number
+  uom_compliance_rate: number
+  description_limit_rate: number
+  missing_field_rate: number
+  evidence_backed_rate: number
+  compliance?: {
+    lov: ComplianceDetail
+    uom: ComplianceDetail
+    source: ComplianceDetail
+  }
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers)
@@ -26,9 +57,19 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export function login(username: string, password: string) {
-  return request<{ access_token: string; token_type: string }>('/api/auth/login', {
+  return request<{ access_token: string; token_type: string; user?: UserProfile }>('/api/auth/login', {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }),
   })
+}
+
+export function signup(username: string, email: string, password: string) {
+  return request<{ access_token: string; token_type: string; user?: UserProfile }>('/api/auth/signup', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, email, password }),
+  })
+}
+
+export function getCurrentUser() {
+  return request<UserProfile>('/api/auth/me')
 }
 
 export function logout() {
@@ -67,6 +108,15 @@ export function searchProducts(query: string, jobId?: string) {
   return request<{ job_id: string; product: ProductResult }[]>(`/api/pipeline/search?${params.toString()}`)
 }
 
+export function scanSearch(file: File) {
+  const form = new FormData()
+  form.append('file', file)
+  return request<{ detected_code: string; filename: string; matches: { job_id: string; product: ProductResult }[] }>('/api/pipeline/scan-search', {
+    method: 'POST',
+    body: form,
+  })
+}
+
 export function approveReview(productRowId: string, overrides: Record<number, string> = {}) {
   const params = new URLSearchParams({ product_row_id: productRowId })
   return request<{ status: string }>(`/api/pipeline/review/approve?${params.toString()}`, {
@@ -90,7 +140,7 @@ export function getProductEvidence(mfgPartNum: string, query = 'product specific
 }
 
 export function getMetrics() {
-  return request<Record<string, number>>('/api/pipeline/metrics')
+  return request<MetricsResponse>('/api/pipeline/metrics')
 }
 
 export function getChatAnswer(query: string, chatHistory: { role: string; content: string }[] = []) {

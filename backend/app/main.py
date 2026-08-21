@@ -14,17 +14,15 @@ app = FastAPI(
     version=settings.app_version,
 )
 
-# Enable CORS for the React dashboard frontend. Include both localhost and 127.0.0.1 variants
-# because the dev server may be opened from either hostname.
+# Enable CORS for the React dashboard frontend
 origins = [origin.strip() for origin in settings.frontend_urls.split(",") if origin.strip()]
-if "http://localhost:3000" not in origins:
-    origins.append("http://localhost:3000")
-if "http://127.0.0.1:3000" not in origins:
-    origins.append("http://127.0.0.1:3000")
+for default_origin in ["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:3001", "http://127.0.0.1:3001"]:
+    if default_origin not in origins:
+        origins.append(default_origin)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=origins if origins else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

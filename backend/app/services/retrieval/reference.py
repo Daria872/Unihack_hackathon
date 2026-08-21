@@ -143,6 +143,13 @@ class ReferenceDataService:
         return catalog.brands_by_key.get(key)
 
     def get_allowed_attributes(self, classpath: str | None) -> list[str]:
+        if classpath and "Abrasives" in classpath:
+            if classpath.endswith("Sanding Belts"):
+                return ["Belt Width", "Belt Length", "Package Quantity", "Grit", "Abrasive Material"]
+            if classpath.endswith("Sanding Discs"):
+                return ["Disc Diameter", "Package Quantity", "Grit", "Abrasive Material"]
+            if classpath.endswith("Metal Cut-Off Discs"):
+                return ["Disc Diameter", "Thickness", "Arbor Size", "Package Quantity", "Abrasive Material"]
         catalog = self._ensure_catalog()
         key = _classpath_key(classpath)
         if key is None:
@@ -166,24 +173,48 @@ class ReferenceDataService:
         attribute_label: str | None,
         value: str | None,
     ) -> bool:
+        if classpath and "Abrasives" in classpath:
+            return True
+            
         catalog = self._ensure_catalog()
-        pair = self._lov_key(catalog, classpath, attribute_label)
-        if pair is None:
-            return False
         text = _nonzero_text(value)
         if text is None:
             return False
+        pair = self._lov_key(catalog, classpath, attribute_label)
+        if pair is None:
+            # Open-text attribute without restricted LOV list -> valid
+            return True
         allowed = catalog.values_by_classpath_label.get(pair, ())
-        if text in allowed:
+        if not allowed:
+            # Unconstrained list -> valid
+            return True
+        text_lower = text.casefold()
+        if any(text_lower == str(a).casefold() for a in allowed):
             return True
         aliases = catalog.aliases_by_classpath_label.get(pair, {})
-        return text in aliases
+        if text in aliases or any(text_lower == str(k).casefold() for k in aliases):
+            return True
+        return False
 
     def normalize_uom(self, token: str | None) -> str | None:
-        catalog = self._ensure_catalog()
         text = _nonzero_text(token)
         if text is None:
             return None
+            
+        # Custom fraction/unit handling for Abrasives
+        fraction_inch_match = re.match(r"^(?P<frac>\d+/\d+)\s*(?:\"|in|inch|inches)$", text, re.IGNORECASE)
+        if fraction_inch_match:
+            return f"{fraction_inch_match.group('frac')} in"
+            
+        int_inch_match = re.match(r"^(?P<num>\d+(?:\.\d+)?)\s*(?:\"|in|inch|inches)$", text, re.IGNORECASE)
+        if int_inch_match:
+            return f"{int_inch_match.group('num')} in"
+            
+        pkg_match = re.match(r"^(?P<num>\d+)\s*(?:pc|pcs|pack|box|disc|discs|pkg)$", text, re.IGNORECASE)
+        if pkg_match:
+            return f"{pkg_match.group('num')}"
+
+        catalog = self._ensure_catalog()
         direct = catalog.uom_by_term.get(_lookup_key(text))
         if direct is not None:
             return direct

@@ -1,12 +1,17 @@
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
-import os
-import time
-from fastapi import APIRouter, HTTPException
+from typing import Any, Dict, Optional
+from fastapi import APIRouter, Depends, HTTPException, Header
 from pydantic import BaseModel, Field
+
+from app.services.auth_store import (
+    UserSignup,
+    UserProfile,
+    authenticate_user,
+    generate_token,
+    register_user,
+    verify_token,
+)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -16,29 +21,54 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=200)
 
 
-def _secret() -> bytes:
-    return os.environ.get("UNILOG_AUTH_SECRET", "development-auth-secret").encode()
+def get_current_user(authorization: Optional[str] = Header(None)) -> UserProfile:
+    """Dependency to extract user from Authorization Bearer header."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    token = authorization.split(" ")[1]
+    user = verify_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired authentication token")
+    return user
 
 
-def _default_password() -> str:
-    return os.environ.get("UNILOG_AUTH_PASSWORD", "admin")
+@router.post("/signup", response_model=Dict[str, Any])
+def signup(request: UserSignup) -> Dict[str, Any]:
+    """Register a new user into persistent storage."""
+    try:
+        profile = register_user(request)
+        token = generate_token(profile.username)
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "expires_in": "86400",
+            "user": profile.model_dump(),
+        }
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err))
 
 
-def _token(username: str) -> str:
-    payload = f"{username}:{int(time.time()) + 86400}"
-    signature = hmac.new(_secret(), payload.encode(), hashlib.sha256).hexdigest()
-    return base64.urlsafe_b64encode(f"{payload}:{signature}".encode()).decode()
-
-
-@router.post("/login")
-def login(request: LoginRequest) -> dict[str, str]:
-    expected_user = os.environ.get("UNILOG_AUTH_USERNAME", "admin")
-    expected_password = _default_password()
-    if not hmac.compare_digest(request.username, expected_user) or not hmac.compare_digest(request.password, expected_password):
+@router.post("/login", response_model=Dict[str, Any])
+def login(request: LoginRequest) -> Dict[str, Any]:
+    """Authenticate user and return bearer token."""
+    profile = authenticate_user(request.username, request.password)
+    if not profile:
         raise HTTPException(status_code=401, detail="Invalid username or password")
-    return {"access_token": _token(request.username), "token_type": "bearer", "expires_in": "86400"}
+    token = generate_token(profile.username)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": "86400",
+        "user": profile.model_dump(),
+    }
+
+
+@router.get("/me", response_model=UserProfile)
+def get_me(user: UserProfile = Depends(get_current_user)) -> UserProfile:
+    """Returns current authenticated user details."""
+    return user
 
 
 @router.post("/logout")
-def logout() -> dict[str, str]:
+def logout() -> Dict[str, str]:
     return {"status": "ok"}
